@@ -1,0 +1,30 @@
+{
+  "generated_at_utc": "2026-03-06T01:12:23.730591+00:00",
+  "scope": "nomask",
+  "dtype": "float32",
+  "shape": [
+    10,
+    768
+  ],
+  "row_alignment": "row_results_index",
+  "storage": "numpy_memmap",
+  "input_norm_path": "/Users/cyyoon/dev/llmops/final_metric_refactor/results/langfuse_csv_smoke_20260306_1/_temp/embeddings/langfuse_smoke_prod_data_sample_langfuse_preprocessed_test_nomask_input_norm.f32.npy",
+  "output_norm_path": "/Users/cyyoon/dev/llmops/final_metric_refactor/results/langfuse_csv_smoke_20260306_1/_temp/embeddings/langfuse_smoke_prod_data_sample_langfuse_preprocessed_test_nomask_output_norm.f32.npy",
+  "valid_rows": 10,
+  "valid_rate": 1.0,
+  "valid_row_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "source": "auto_rebuild",
+  "embedder": "hash:768",
+  "rebuilt": true
+}

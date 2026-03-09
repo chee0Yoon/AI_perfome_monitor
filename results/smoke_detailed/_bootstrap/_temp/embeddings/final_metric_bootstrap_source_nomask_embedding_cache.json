@@ -1,0 +1,27 @@
+{
+  "generated_at_utc": "2026-03-05T04:59:16.931835+00:00",
+  "scope": "nomask",
+  "dtype": "float32",
+  "shape": [
+    6,
+    768
+  ],
+  "row_alignment": "row_results_index",
+  "storage": "numpy_memmap",
+  "input_norm_path": "/Users/cyyoon/dev/llmops/final_metric_refactor/results/smoke_detailed/_bootstrap/_temp/embeddings/final_metric_bootstrap_source_nomask_input_norm.f32.npy",
+  "output_norm_path": "/Users/cyyoon/dev/llmops/final_metric_refactor/results/smoke_detailed/_bootstrap/_temp/embeddings/final_metric_bootstrap_source_nomask_output_norm.f32.npy",
+  "valid_rows": 6,
+  "valid_rate": 1.0,
+  "valid_row_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "source": "distribution_outlier_pipeline",
+  "tag": "final_metric_bootstrap",
+  "stem": "source",
+  "rows": 6
+}
