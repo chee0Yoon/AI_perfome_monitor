@@ -84,6 +84,14 @@ from final_metric_refactor.config import (
 from final_metric_refactor.scoring import compute_bundle_scores, render_bundle_score_dashboard
 from final_metric_refactor.scoring.warn_inspect import compute_warn_inspect
 from final_metric_refactor.config.data_paths import default_ambiguous_csv
+from final_metric_refactor.manual_review import (
+    MANUAL_REVIEW_K_CANDIDATES,
+    apply_manual_final_overrides,
+    build_group_local_propagation_mask,
+    choose_manual_review_k,
+    compute_manual_pass_precision,
+    load_manual_override_csv,
+)
 from final_metric_refactor.signaling import run_distribution_pipeline
 from final_metric_refactor.report.writer import ensure_report_dir, write_csv, write_json
 
@@ -122,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--row-results-csv", default="", help="Existing row_results CSV. Omit to bootstrap from source.")
     p.add_argument("--max-rows", type=int, default=0, help="0 means full dataset.")
+    p.add_argument("--manual-override-csv", default="", help="Optional human review override CSV.")
 
     # Output
     p.add_argument("--output-dir", required=True, help="Output root directory.")
@@ -202,6 +211,7 @@ def _config_to_namespace(config: FinalMetricConfig) -> argparse.Namespace:
         run_tag=str(config.run_tag),
         source_csv=str(Path(config.source_csv).resolve()),
         row_results_csv=(str(Path(config.row_results_csv).resolve()) if config.row_results_csv else ""),
+        manual_override_csv=(str(Path(config.manual_override_csv).resolve()) if config.manual_override_csv else ""),
         output_dir=str(output_root),
         report_dir_name="report",
         tag=str(config.output_tag),
@@ -256,6 +266,168 @@ def bool_series(s: pd.Series) -> np.ndarray:
         .fillna(False)
     )
     return mapped.to_numpy(dtype=bool)
+
+
+def _mean_bundle_new_score(summary_df: pd.DataFrame) -> float:
+    if "New_score" not in summary_df.columns or summary_df.empty:
+        return float("nan")
+    vals = pd.to_numeric(summary_df["New_score"], errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float("nan")
+    return float(np.mean(vals))
+
+
+def _map_label_to_review_eval(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text in {"seed_pass", "final_pass", "pass", "correct", "acceptable", "idea", "true", "1"}:
+        return "pass"
+    if text in {"final_fail", "fail", "incorrect", "false", "0"}:
+        return "fail"
+    return "unreviewed"
+
+
+def _build_review_eval_series(
+    *,
+    row_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    args: argparse.Namespace,
+) -> pd.Series:
+    review_eval = pd.Series(["unreviewed"] * len(row_df), index=row_df.index, dtype=object)
+    if args.label_col in source_df.columns and len(source_df) == len(row_df):
+        review_eval = source_df[args.label_col].map(_map_label_to_review_eval).astype(object)
+        review_eval.index = row_df.index
+    if "manual_review_label" in row_df.columns:
+        manual_eval = row_df["manual_review_label"].map(_map_label_to_review_eval).astype(object)
+        mask = manual_eval.ne("unreviewed")
+        review_eval.loc[mask] = manual_eval.loc[mask]
+    return review_eval
+
+
+def _flatten_score_columns(summary_df: pd.DataFrame, detail_df: pd.DataFrame) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for rec in summary_df.to_dict(orient="records"):
+        bundle = str(rec.get("bundle", "")).strip()
+        if not bundle:
+            continue
+        out[f"score_{bundle.lower()}_bundle"] = rec.get("bundle_score", np.nan)
+        out[f"score_{bundle.lower()}_new"] = rec.get("New_score", np.nan)
+        out[f"score_{bundle.lower()}_bucket"] = rec.get("bundle_score_bucket", np.nan)
+        out[f"score_{bundle.lower()}_risk"] = rec.get("key_risk", np.nan)
+        out[f"score_{bundle.lower()}_confidence"] = rec.get("bundle_confidence", np.nan)
+    for rec in detail_df.to_dict(orient="records"):
+        submetric = str(rec.get("submetric", "")).strip().lower()
+        if not submetric:
+            continue
+        out[f"score_{submetric}_bucket"] = rec.get("subscore", np.nan)
+        out[f"score_{submetric}_precise"] = rec.get("subscore_precise", np.nan)
+        out[f"score_{submetric}_raw"] = rec.get("raw_value", np.nan)
+    return out
+
+
+def build_raw_data_export(
+    *,
+    source_df: pd.DataFrame,
+    row_df: pd.DataFrame,
+    score_summary_df: pd.DataFrame,
+    score_detail_df: pd.DataFrame,
+    args: argparse.Namespace,
+    pre_manual_row_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    raw = source_df.reset_index(drop=True).copy()
+    metrics = row_df.reset_index(drop=True).copy()
+    if pre_manual_row_df is None:
+        pre_manual_row_df = row_df.copy()
+    pre_manual = pre_manual_row_df.reset_index(drop=True).copy()
+
+    id_col = str(getattr(args, "id_col", "id"))
+    if id_col in raw.columns and "row_id" not in raw.columns:
+        raw["row_id"] = raw[id_col].astype(str)
+    elif "row_id" not in raw.columns:
+        raw["row_id"] = [f"row_{i}" for i in range(len(raw))]
+
+    metrics["review_eval"] = _build_review_eval_series(row_df=metrics, source_df=raw, args=args)
+    metrics["model_state"] = pre_manual.get("distribution_state_nomask", pd.Series(["na"] * len(metrics))).fillna("na").astype(str)
+    metrics["model_pass"] = pre_manual.get("final_pass_nomask", pd.Series([False] * len(metrics))).fillna(False).astype(bool)
+    metrics["final_state"] = metrics.get("final_state_nomask", pd.Series(["hard_gate_fail"] * len(metrics))).fillna("hard_gate_fail").astype(str)
+    metrics["final_eval"] = metrics["final_state"].map(lambda x: "pass" if str(x).strip().lower() == "pass" else "fail")
+
+    score_cols = _flatten_score_columns(score_summary_df, score_detail_df)
+    if score_cols:
+        score_df = pd.DataFrame(
+            {key: pd.Series([value] * len(metrics), index=metrics.index) for key, value in score_cols.items()}
+        )
+        metrics = pd.concat([metrics, score_df], axis=1)
+
+    merged = raw.merge(metrics, on="row_id", how="left", suffixes=("", "_metric"))
+    return merged
+
+
+def _build_manual_label_override_map(
+    *,
+    row_df: pd.DataFrame,
+    results_id_col: str,
+    positive_mask: np.ndarray,
+    final_pass_ids: set[str],
+    final_fail_ids: set[str],
+) -> dict[str, bool]:
+    row_ids = row_df[results_id_col].fillna("").astype(str).str.strip()
+    positive_ids = set(row_ids[np.asarray(positive_mask, dtype=bool)].tolist())
+    positive_ids.update(final_pass_ids)
+    out = {str(row_id): False for row_id in positive_ids}
+    for row_id in final_fail_ids:
+        out[str(row_id)] = True
+    return out
+
+
+def _copy_manual_columns(
+    *,
+    final_row_df: pd.DataFrame,
+    overrides_df: pd.DataFrame,
+    results_id_col: str,
+    anchor_mask: np.ndarray,
+    propagated_mask: np.ndarray,
+    final_row_df_before_hard_override: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    out = final_row_df.copy()
+    review_map = dict(
+        zip(
+            overrides_df["row_id"].astype(str).tolist(),
+            overrides_df["review_label"].astype(str).tolist(),
+            strict=False,
+        )
+    )
+    row_ids = out[results_id_col].fillna("").astype(str).str.strip()
+    out["manual_review_label"] = row_ids.map(lambda x: review_map.get(x, "")).astype(object)
+    out["manual_anchor_pass"] = np.asarray(anchor_mask, dtype=bool)
+    out["manual_propagated_pass"] = np.asarray(propagated_mask, dtype=bool)
+
+    if final_row_df_before_hard_override is None:
+        changed = np.asarray(anchor_mask, dtype=bool) | np.asarray(propagated_mask, dtype=bool)
+    else:
+        changed = np.zeros(len(out), dtype=bool)
+        compare_cols = [
+            "distribution_pass_nomask",
+            "distribution_warn_nomask",
+            "distribution_fail_nomask",
+            "distribution_hard_fail_nomask",
+            "distribution_state_nomask",
+            "final_pass_nomask",
+            "final_state_nomask",
+        ]
+        for col in compare_cols:
+            if col not in out.columns or col not in final_row_df_before_hard_override.columns:
+                continue
+            before = final_row_df_before_hard_override[col]
+            after = out[col]
+            if before.dtype == object or after.dtype == object:
+                diff = before.fillna("").astype(str).ne(after.fillna("").astype(str)).to_numpy(dtype=bool)
+            else:
+                diff = before.fillna(False).astype(str).ne(after.fillna(False).astype(str)).to_numpy(dtype=bool)
+            changed |= diff
+        changed |= row_ids.isin(set(overrides_df["row_id"].astype(str).tolist())).to_numpy(dtype=bool)
+    out["manual_rescore_applied"] = changed.astype(bool)
+    return out
 
 
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
@@ -1479,6 +1651,7 @@ def apply_hybrid_thresholds_nomask(
     row_df: pd.DataFrame,
     rules: list[str],
     args: argparse.Namespace,
+    label_override_map: dict[str, bool] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = FINAL_THRESHOLD_RUNTIME
     tail_direction = str(args.tail_direction)
@@ -1495,6 +1668,14 @@ def apply_hybrid_thresholds_nomask(
         label_col=args.label_col,
         bad_label=args.bad_label,
     )
+    if label_override_map and args.results_id_col in out.columns:
+        rid = out[args.results_id_col].fillna("").astype(str).str.strip()
+        override_mask = rid.isin(set(label_override_map.keys())).to_numpy(dtype=bool)
+        if np.any(override_mask):
+            mapped = rid.map(lambda x: label_override_map.get(str(x), False)).to_numpy(dtype=bool)
+            y_bad[override_mask] = mapped[override_mask]
+            label_known[override_mask] = True
+            has_labels = bool(np.any(label_known))
 
     hard_gate = bool_series(out["hard_gate_pass"]) if "hard_gate_pass" in out.columns else np.ones(len(out), dtype=bool)
     base_new_cols: dict[str, pd.Series] = {}
@@ -3146,6 +3327,256 @@ def build_edge_input_aux_payload(
     }
 
 
+def _load_score_embeddings(
+    *,
+    args: argparse.Namespace,
+    out_dir: Path,
+    row_csv: Path,
+    row_df: pd.DataFrame,
+    tag: str,
+    stem: str,
+) -> tuple[Any, np.ndarray | None, np.ndarray | None, dict[str, Any]]:
+    cache_meta_path, cache_note = _resolve_embedding_cache_meta_path(
+        args=args,
+        row_csv=row_csv.resolve(),
+        out_dir=out_dir.resolve(),
+        tag=tag,
+        stem=stem,
+    )
+    cache_paths = resolve_embedding_cache_paths(
+        output_dir=out_dir.resolve(),
+        tag=tag,
+        stem=stem,
+        meta_json_path=cache_meta_path,
+    )
+    cache_load_note = dict(cache_note)
+    cache_load_note["meta_json"] = str(cache_paths.meta_json_path.resolve())
+
+    loaded_cache = None
+    cache_error = None
+    try:
+        loaded_cache = load_embedding_cache(paths=cache_paths)
+        if int(loaded_cache.input_norm.shape[0]) != len(row_df):
+            raise ValueError(
+                f"cache row mismatch: cache={loaded_cache.input_norm.shape[0]}, rows={len(row_df)}"
+            )
+        cache_load_note["status"] = "loaded"
+        cache_load_note["source"] = "existing"
+    except Exception as exc:
+        cache_error = str(exc)
+        if bool(args.rebuild_embedding_cache):
+            embedder = _build_embedder_module(
+                backend=str(args.embedding_backend),
+                embedding_model=str(args.embedding_model),
+                hash_dim=768,
+            )
+            loaded_cache = load_or_rebuild_embedding_cache(
+                paths=build_embedding_cache_paths(output_dir=out_dir.resolve(), tag=tag, stem=stem),
+                expected_rows=len(row_df),
+                input_texts=row_df["source_input"].fillna("").astype(str).tolist(),
+                output_texts=row_df["source_output"].fillna("").astype(str).tolist(),
+                embedder=embedder,
+                batch_size=int(args.embedding_batch_size),
+                allow_rebuild=True,
+            )
+            cache_load_note["status"] = "rebuilt"
+            cache_load_note["source"] = "auto_rebuild"
+        else:
+            cache_load_note["status"] = "missing"
+            cache_load_note["source"] = "none"
+
+    input_norm = None
+    output_norm = None
+    if loaded_cache is not None:
+        cache_load_note["meta_json"] = str(loaded_cache.paths.meta_json_path)
+        input_norm = np.asarray(loaded_cache.input_norm, dtype=float)
+        output_norm = np.asarray(loaded_cache.output_norm, dtype=float)
+        cache_load_note["input_norm_path"] = str(loaded_cache.paths.input_norm_path)
+        cache_load_note["output_norm_path"] = str(loaded_cache.paths.output_norm_path)
+        cache_load_note["valid_rows"] = int(loaded_cache.meta.get("valid_rows", len(row_df)))
+    elif cache_error is not None:
+        cache_load_note["error"] = cache_error
+
+    return loaded_cache, input_norm, output_norm, cache_load_note
+
+
+def _apply_manual_rescore_nomask(
+    *,
+    source_df: pd.DataFrame,
+    row_df: pd.DataFrame,
+    threshold_summary_df: pd.DataFrame,
+    args: argparse.Namespace,
+    rules: list[str],
+    input_norm: np.ndarray | None,
+    output_norm: np.ndarray | None,
+    embedding_meta: dict[str, Any] | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    stats: dict[str, Any] = {
+        "enabled": False,
+        "selected_k": 0,
+        "affected_groups": 0,
+        "anchor_rows": 0,
+        "propagated_rows": 0,
+        "hard_override_rows": 0,
+        "final_pass_rate_pre": float("nan"),
+        "final_pass_rate_post": float("nan"),
+        "new_score_pre": float("nan"),
+        "new_score_post": float("nan"),
+    }
+    manual_override_csv = str(getattr(args, "manual_override_csv", "") or "").strip()
+    if not manual_override_csv:
+        return row_df, threshold_summary_df, stats
+    if args.results_id_col not in row_df.columns:
+        raise ValueError(f"manual override requires results id column '{args.results_id_col}'")
+
+    overrides = load_manual_override_csv(
+        manual_override_csv,
+        valid_row_ids=row_df[args.results_id_col].fillna("").astype(str).tolist(),
+    )
+    base_row_df = row_df.copy()
+    base_threshold_summary_df = threshold_summary_df.copy()
+
+    base_artifacts = compute_bundle_scores(
+        row_df=base_row_df,
+        threshold_summary_df=base_threshold_summary_df,
+        score_runtime=SCORE_RUNTIME,
+        input_norm=input_norm,
+        output_norm=output_norm,
+        embedding_meta=embedding_meta,
+    )
+    stats["enabled"] = True
+    stats["hard_override_rows"] = int(len(overrides.final_pass_ids) + len(overrides.final_fail_ids))
+    stats["final_pass_rate_pre"] = (
+        float(base_row_df["final_pass_nomask"].astype(bool).mean()) if "final_pass_nomask" in base_row_df.columns else float("nan")
+    )
+    stats["new_score_pre"] = _mean_bundle_new_score(base_artifacts.summary_df)
+
+    row_ids = row_df[args.results_id_col].fillna("").astype(str).str.strip()
+    anchor_mask = row_ids.isin(overrides.seed_pass_ids).to_numpy(dtype=bool)
+    group_ids = row_df["distribution_group_id"].fillna("g0000").astype(str)
+    affected_groups = set(group_ids[anchor_mask].tolist())
+    stats["affected_groups"] = int(len(affected_groups))
+    stats["anchor_rows"] = int(np.sum(anchor_mask))
+
+    if np.any(anchor_mask):
+        if input_norm is None:
+            raise ValueError("manual seed_pass rescore requires input embeddings")
+        y_bad, label_known, _ = compute_labels_bad(
+            source_df=source_df,
+            row_df=row_df,
+            source_id_col=args.source_id_col,
+            results_id_col=args.results_id_col,
+            label_col=args.label_col,
+            bad_label=args.bad_label,
+        )
+        affected_mask = group_ids.isin(affected_groups).to_numpy(dtype=bool)
+        candidate_rows: list[dict[str, Any]] = []
+
+        for k in MANUAL_REVIEW_K_CANDIDATES:
+            propagated_mask = build_group_local_propagation_mask(
+                input_norm=input_norm,
+                group_ids=group_ids.to_numpy(dtype=object),
+                anchor_mask=anchor_mask,
+                k=int(k),
+            )
+            positive_mask = anchor_mask | propagated_mask
+            label_override_map = _build_manual_label_override_map(
+                row_df=row_df,
+                results_id_col=args.results_id_col,
+                positive_mask=positive_mask,
+                final_pass_ids=overrides.final_pass_ids,
+                final_fail_ids=overrides.final_fail_ids,
+            )
+            candidate_row_df, candidate_threshold_summary_df = apply_hybrid_thresholds_nomask(
+                source_df=source_df,
+                row_df=row_df,
+                rules=rules,
+                args=args,
+                label_override_map=label_override_map,
+            )
+            patched_row_df = base_row_df.copy()
+            patch_mask = affected_mask & positive_mask
+            patched_row_df.loc[patch_mask, candidate_row_df.columns] = candidate_row_df.loc[patch_mask, candidate_row_df.columns].to_numpy()
+            patched_before_hard = patched_row_df.copy()
+            selected_positive_ids = set(row_ids[np.asarray(positive_mask, dtype=bool)].tolist())
+            patched_row_df = apply_manual_final_overrides(
+                patched_row_df,
+                row_id_col=args.results_id_col,
+                final_pass_ids=(selected_positive_ids | set(overrides.final_pass_ids)),
+                final_fail_ids=overrides.final_fail_ids,
+            )
+            patched_row_df = _copy_manual_columns(
+                final_row_df=patched_row_df,
+                overrides_df=overrides.table,
+                results_id_col=args.results_id_col,
+                anchor_mask=anchor_mask,
+                propagated_mask=propagated_mask,
+                final_row_df_before_hard_override=patched_before_hard,
+            )
+            candidate_artifacts = compute_bundle_scores(
+                row_df=patched_row_df,
+                threshold_summary_df=candidate_threshold_summary_df,
+                score_runtime=SCORE_RUNTIME,
+                input_norm=input_norm,
+                output_norm=output_norm,
+                embedding_meta=embedding_meta,
+            )
+            candidate_rows.append(
+                {
+                    "k": int(k),
+                    "precision": compute_manual_pass_precision(
+                        selected_mask=positive_mask,
+                        y_bad=y_bad,
+                        label_known=label_known,
+                    ),
+                    "propagated_mask": propagated_mask,
+                    "row_df": patched_row_df,
+                    "threshold_summary_df": candidate_threshold_summary_df,
+                    "final_pass_rate_post": (
+                        float(patched_row_df["final_pass_nomask"].astype(bool).mean())
+                        if "final_pass_nomask" in patched_row_df.columns
+                        else float("nan")
+                    ),
+                    "new_score_post": _mean_bundle_new_score(candidate_artifacts.summary_df),
+                }
+            )
+
+        chosen = choose_manual_review_k(candidate_rows)
+        stats["selected_k"] = int(chosen["k"])
+        stats["propagated_rows"] = int(np.sum(np.asarray(chosen["propagated_mask"], dtype=bool)))
+        stats["final_pass_rate_post"] = float(chosen["final_pass_rate_post"])
+        stats["new_score_post"] = float(chosen["new_score_post"])
+        return chosen["row_df"], chosen["threshold_summary_df"], stats
+
+    final_row_df = apply_manual_final_overrides(
+        base_row_df,
+        row_id_col=args.results_id_col,
+        final_pass_ids=overrides.final_pass_ids,
+        final_fail_ids=overrides.final_fail_ids,
+    )
+    final_row_df = _copy_manual_columns(
+        final_row_df=final_row_df,
+        overrides_df=overrides.table,
+        results_id_col=args.results_id_col,
+        anchor_mask=np.zeros(len(final_row_df), dtype=bool),
+        propagated_mask=np.zeros(len(final_row_df), dtype=bool),
+        final_row_df_before_hard_override=base_row_df,
+    )
+    final_artifacts = compute_bundle_scores(
+        row_df=final_row_df,
+        threshold_summary_df=base_threshold_summary_df,
+        score_runtime=SCORE_RUNTIME,
+        input_norm=input_norm,
+        output_norm=output_norm,
+        embedding_meta=embedding_meta,
+    )
+    stats["new_score_post"] = _mean_bundle_new_score(final_artifacts.summary_df)
+    stats["final_pass_rate_post"] = (
+        float(final_row_df["final_pass_nomask"].astype(bool).mean()) if "final_pass_nomask" in final_row_df.columns else float("nan")
+    )
+    return final_row_df, base_threshold_summary_df, stats
+
+
 def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
     threshold_cfg = FINAL_THRESHOLD_RUNTIME
     rules = parse_rules(args.rules)
@@ -3199,16 +3630,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         )
     else:
         updated_row_df["detail_override_applied_nomask"] = False
-
-    summary_df = build_operational_summary(updated_row_df, threshold_summary_df)
-    summary_df["inspection_mode"] = str(args.inspection_mode)
-    summary_df["detail_mode_enabled"] = bool(str(args.inspection_mode) == "detailed")
-    summary_df["detail_override_rows"] = int(detail_override_stats["detail_override_rows"])
-    summary_df["detail_fail_rate_hard_eval"] = float(detail_override_stats["detail_fail_rate_hard_eval"])
-    summary_df["detail_distribution_pass_rate_pre"] = float(detail_override_stats["distribution_pass_rate_pre"])
-    summary_df["detail_distribution_pass_rate_post"] = float(detail_override_stats["distribution_pass_rate_post"])
-    summary_df["detail_final_pass_rate_pre"] = float(detail_override_stats["final_pass_rate_pre"])
-    summary_df["detail_final_pass_rate_post"] = float(detail_override_stats["final_pass_rate_post"])
+    pre_manual_row_df = updated_row_df.copy()
 
     stem = source_csv.stem
     tag = args.tag
@@ -3216,9 +3638,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
     row_out = report_dir / f"{tag}_{stem}_row_results.csv"
     summary_out = report_dir / f"{tag}_{stem}_summary.csv"
     cfg_out = report_dir / f"{tag}_{stem}_run_config.json"
-
-    write_csv(updated_row_df, row_out, index=False)
-    write_csv(summary_df, summary_out, index=False)
+    raw_export_out = report_dir / f"{tag}_{stem}_raw_data_with_scores.csv"
 
     cfg = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -3226,6 +3646,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         "input_row_results_csv": str(row_csv),
         "output_row_results_csv": str(row_out),
         "output_summary_csv": str(summary_out),
+        "output_raw_data_with_scores_csv": str(raw_export_out),
         "inspection_mode": str(args.inspection_mode),
         "rules": rules,
         "threshold_policy": "hybrid_tailstart_core_exceptional",
@@ -3257,6 +3678,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
             "hard_ratio_from_fail": float(threshold_cfg.hard_ratio_from_fail),
         },
         "detail_override": detail_override_stats,
+        "manual_review": {},
         "runtime_args": {
             "source_csv": str(source_csv),
             "input_row_results_csv": str(row_csv),
@@ -3264,14 +3686,13 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
             "rules": rules,
             "max_rows": int(args.max_rows),
             "tail_direction": str(args.tail_direction),
+            "manual_override_csv": str(getattr(args, "manual_override_csv", "") or ""),
         },
     }
 
     thr_rule_out = report_dir / f"{tag}_{stem}_rule_thresholds.csv"
     thr_summary_out = report_dir / f"{tag}_{stem}_thresholds_summary.csv"
     thr_compact_out = report_dir / f"{tag}_{stem}_rule_thresholds_compact.csv"
-    write_csv(threshold_summary_df, thr_rule_out, index=False)
-    write_csv(threshold_summary_df, thr_summary_out, index=False)
     compact_cols = [
         "rule",
         "selected_method",
@@ -3288,11 +3709,11 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         "warn_n",
     ]
     use_compact = [c for c in compact_cols if c in threshold_summary_df.columns]
-    write_csv(threshold_summary_df[use_compact], thr_compact_out, index=False)
 
     cfg["output_rule_thresholds_csv"] = str(thr_rule_out)
     cfg["output_rule_thresholds_compact_csv"] = str(thr_compact_out)
     cfg["output_thresholds_summary_csv"] = str(thr_summary_out)
+    cfg["output_raw_data_with_scores_csv"] = str(raw_export_out)
 
     score_summary_out = report_dir / f"{tag}_{stem}_bundle_scores_summary.csv"
     score_detail_out = report_dir / f"{tag}_{stem}_bundle_scores_detail.csv"
@@ -3339,66 +3760,24 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         "rows": [],
         "reason": "integrated_mode",
     }
-    cache_meta_path, cache_note = _resolve_embedding_cache_meta_path(
+    loaded_cache, input_norm, output_norm, cache_load_note = _load_score_embeddings(
         args=args,
-        row_csv=row_csv.resolve(),
-        out_dir=out_dir.resolve(),
+        out_dir=out_dir,
+        row_csv=row_csv,
+        row_df=updated_row_df,
         tag=tag,
         stem=stem,
     )
-    cache_paths = resolve_embedding_cache_paths(
-        output_dir=out_dir.resolve(),
-        tag=tag,
-        stem=stem,
-        meta_json_path=cache_meta_path,
+    updated_row_df, threshold_summary_df, manual_review_stats = _apply_manual_rescore_nomask(
+        source_df=source_df,
+        row_df=updated_row_df,
+        threshold_summary_df=threshold_summary_df,
+        args=args,
+        rules=rules,
+        input_norm=input_norm,
+        output_norm=output_norm,
+        embedding_meta=(loaded_cache.meta if loaded_cache is not None else None),
     )
-    cache_load_note = dict(cache_note)
-    cache_load_note["meta_json"] = str(cache_paths.meta_json_path.resolve())
-
-    loaded_cache = None
-    cache_error = None
-    try:
-        loaded_cache = load_embedding_cache(paths=cache_paths)
-        if int(loaded_cache.input_norm.shape[0]) != len(updated_row_df):
-            raise ValueError(
-                f"cache row mismatch: cache={loaded_cache.input_norm.shape[0]}, rows={len(updated_row_df)}"
-            )
-        cache_load_note["status"] = "loaded"
-        cache_load_note["source"] = "existing"
-    except Exception as exc:
-        cache_error = str(exc)
-        if bool(args.rebuild_embedding_cache):
-            embedder = _build_embedder_module(
-                backend=str(args.embedding_backend),
-                embedding_model=str(args.embedding_model),
-                hash_dim=768,
-            )
-            loaded_cache = load_or_rebuild_embedding_cache(
-                paths=build_embedding_cache_paths(output_dir=out_dir.resolve(), tag=tag, stem=stem),
-                expected_rows=len(updated_row_df),
-                input_texts=updated_row_df["source_input"].fillna("").astype(str).tolist(),
-                output_texts=updated_row_df["source_output"].fillna("").astype(str).tolist(),
-                embedder=embedder,
-                batch_size=int(args.embedding_batch_size),
-                allow_rebuild=True,
-            )
-            cache_load_note["status"] = "rebuilt"
-            cache_load_note["source"] = "auto_rebuild"
-        else:
-            cache_load_note["status"] = "missing"
-            cache_load_note["source"] = "none"
-
-    input_norm = None
-    output_norm = None
-    if loaded_cache is not None:
-        cache_load_note["meta_json"] = str(loaded_cache.paths.meta_json_path)
-        input_norm = np.asarray(loaded_cache.input_norm, dtype=float)
-        output_norm = np.asarray(loaded_cache.output_norm, dtype=float)
-        cache_load_note["input_norm_path"] = str(loaded_cache.paths.input_norm_path)
-        cache_load_note["output_norm_path"] = str(loaded_cache.paths.output_norm_path)
-        cache_load_note["valid_rows"] = int(loaded_cache.meta.get("valid_rows", len(updated_row_df)))
-    elif cache_error is not None:
-        cache_load_note["error"] = cache_error
 
     artifacts = compute_bundle_scores(
         row_df=updated_row_df,
@@ -3408,6 +3787,43 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         output_norm=output_norm,
         embedding_meta=loaded_cache.meta if loaded_cache is not None else None,
     )
+
+    summary_df = build_operational_summary(updated_row_df, threshold_summary_df)
+    summary_df["inspection_mode"] = str(args.inspection_mode)
+    summary_df["detail_mode_enabled"] = bool(str(args.inspection_mode) == "detailed")
+    summary_df["detail_override_rows"] = int(detail_override_stats["detail_override_rows"])
+    summary_df["detail_fail_rate_hard_eval"] = float(detail_override_stats["detail_fail_rate_hard_eval"])
+    summary_df["detail_distribution_pass_rate_pre"] = float(detail_override_stats["distribution_pass_rate_pre"])
+    summary_df["detail_distribution_pass_rate_post"] = float(detail_override_stats["distribution_pass_rate_post"])
+    summary_df["detail_final_pass_rate_pre"] = float(detail_override_stats["final_pass_rate_pre"])
+    summary_df["detail_final_pass_rate_post"] = float(detail_override_stats["final_pass_rate_post"])
+    summary_df["manual_override_enabled"] = bool(manual_review_stats.get("enabled", False))
+    summary_df["manual_override_selected_k"] = int(manual_review_stats.get("selected_k", 0) or 0)
+    summary_df["manual_override_affected_groups"] = int(manual_review_stats.get("affected_groups", 0) or 0)
+    summary_df["manual_override_anchor_rows"] = int(manual_review_stats.get("anchor_rows", 0) or 0)
+    summary_df["manual_override_propagated_rows"] = int(manual_review_stats.get("propagated_rows", 0) or 0)
+    summary_df["manual_override_hard_override_rows"] = int(manual_review_stats.get("hard_override_rows", 0) or 0)
+    summary_df["manual_override_final_pass_rate_pre"] = float(manual_review_stats.get("final_pass_rate_pre", np.nan))
+    summary_df["manual_override_final_pass_rate_post"] = float(manual_review_stats.get("final_pass_rate_post", np.nan))
+    summary_df["manual_override_new_score_pre"] = float(manual_review_stats.get("new_score_pre", np.nan))
+    summary_df["manual_override_new_score_post"] = float(manual_review_stats.get("new_score_post", np.nan))
+
+    raw_export_df = build_raw_data_export(
+        source_df=source_df,
+        row_df=updated_row_df,
+        score_summary_df=artifacts.summary_df,
+        score_detail_df=artifacts.detail_df,
+        args=args,
+        pre_manual_row_df=pre_manual_row_df,
+    )
+
+    write_csv(updated_row_df, row_out, index=False)
+    write_csv(summary_df, summary_out, index=False)
+    write_csv(raw_export_df, raw_export_out, index=False)
+    write_csv(threshold_summary_df, thr_rule_out, index=False)
+    write_csv(threshold_summary_df, thr_summary_out, index=False)
+    write_csv(threshold_summary_df[use_compact], thr_compact_out, index=False)
+
     write_csv(artifacts.summary_df, score_summary_out, index=False, float_format="%.4f")
     write_csv(artifacts.detail_df, score_detail_out, index=False, float_format="%.4f")
     warn_artifacts = compute_warn_inspect(
@@ -3494,6 +3910,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
     }
 
     cfg["score"] = score_status
+    cfg["manual_review"] = manual_review_stats
     cfg["runtime_profile"] = {
         "distribution_mode": "nomask_only",
         "plot_export": "always_on",
@@ -3503,6 +3920,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
 
     print(f"[DONE] row_results: {row_out}")
     print(f"[DONE] summary: {summary_out}")
+    print(f"[DONE] raw_data_with_scores: {raw_export_out}")
     print(f"[DONE] run_config: {cfg_out}")
     print(f"[DONE] rule_thresholds: {thr_rule_out}")
     print(f"[DONE] rule_thresholds_compact: {thr_compact_out}")

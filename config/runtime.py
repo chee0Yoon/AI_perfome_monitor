@@ -377,6 +377,7 @@ class FinalMetricConfig:
 
     # ========== Cache Metadata ==========
     embedding_cache_meta_json: str = ""
+    manual_override_csv: Path | None = None
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> FinalMetricConfig:
@@ -412,6 +413,11 @@ class FinalMetricConfig:
             hist_bins=getattr(args, "hist_bins", 60),
             ratio_bins=getattr(args, "ratio_bins", 16),
             embedding_cache_meta_json=getattr(args, "embedding_cache_meta_json", ""),
+            manual_override_csv=(
+                Path(getattr(args, "manual_override_csv", ""))
+                if hasattr(args, "manual_override_csv") and getattr(args, "manual_override_csv", "")
+                else None
+            ),
             rebuild_embedding_cache=getattr(args, "rebuild_embedding_cache", True),
         )
 
@@ -449,6 +455,11 @@ class FinalMetricConfig:
             hist_bins=int(os.environ.get("FINAL_METRIC_HIST_BINS", "60")),
             ratio_bins=int(os.environ.get("FINAL_METRIC_RATIO_BINS", "16")),
             embedding_cache_meta_json=os.environ.get("FINAL_METRIC_EMBEDDING_CACHE_META_JSON", ""),
+            manual_override_csv=(
+                Path(os.environ.get("FINAL_METRIC_MANUAL_OVERRIDE_CSV"))
+                if os.environ.get("FINAL_METRIC_MANUAL_OVERRIDE_CSV")
+                else None
+            ),
             rebuild_embedding_cache=os.environ.get("FINAL_METRIC_REBUILD_EMBEDDING_CACHE", "true").lower() == "true",
         )
 
@@ -458,6 +469,7 @@ class FinalMetricConfig:
         d["source_csv"] = str(self.source_csv)
         d["row_results_csv"] = str(self.row_results_csv) if self.row_results_csv else None
         d["output_dir"] = str(self.output_dir) if self.output_dir else None
+        d["manual_override_csv"] = str(self.manual_override_csv) if self.manual_override_csv else None
         return d
 
     def resolve_output_dir(self) -> Path:
