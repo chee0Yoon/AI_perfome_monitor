@@ -369,6 +369,18 @@ def round4(x: float) -> float:
     return float(np.round(float(x), 4))
 
 
+def export_score_or_none(x: float, *, hidden: bool = False) -> float | None:
+    if hidden or (not np.isfinite(x)):
+        return None
+    return float(round4(x))
+
+
+def export_bucket_or_none(x: float, *, hidden: bool = False) -> int | None:
+    if hidden or (not np.isfinite(x)):
+        return None
+    return int(_score_to_int(x))
+
+
 def apply_non_catastrophic_floor(
     score: int,
     *,
@@ -2218,7 +2230,7 @@ def compute_bundle_scores(
         diag_score = float(na_neutral_score)
 
     if sem_na:
-        sem_score = float(sem_na_neutral_score)
+        sem_score = float("nan")
         sem_risk = float("nan")
         sem_risk_base = float("nan")
         sem_hard_tail_penalty = float("nan")
@@ -2376,8 +2388,15 @@ def compute_bundle_scores(
         "SEM": float(sem_score),
         "CONF": float(conf_score),
     }
-    bundle_scores_bucket: dict[str, int] = {b: _score_to_int(v) for b, v in bundle_scores_precise.items()}
-    new_scores = {b: float(round4(bundle_scores_precise[b])) for b in BUNDLE_ORDER}
+    bundle_hidden = {"SEM": bool(sem_na)}
+    bundle_scores_bucket: dict[str, int | None] = {
+        b: export_bucket_or_none(bundle_scores_precise[b], hidden=bool(bundle_hidden.get(b, False)))
+        for b in BUNDLE_ORDER
+    }
+    new_scores = {
+        b: export_score_or_none(bundle_scores_precise[b], hidden=bool(bundle_hidden.get(b, False)))
+        for b in BUNDLE_ORDER
+    }
 
     bundle_band = {
         "COV": cov_band,
@@ -2857,8 +2876,8 @@ def compute_bundle_scores(
             "risk_or_base": (None if not np.isfinite(sem_risk_base) else float(round4(sem_risk_base))),
             "hard_tail_penalty": (None if not np.isfinite(sem_hard_tail_penalty) else float(round4(sem_hard_tail_penalty))),
             "risk_or": (None if not np.isfinite(sem_risk) else float(round4(sem_risk))),
-            "score_precise": float(round4(sem_score)),
-            "score_bucket": int(bundle_scores_bucket["SEM"]),
+            "score_precise": export_score_or_none(sem_score, hidden=bool(sem_na)),
+            "score_bucket": export_bucket_or_none(sem_score, hidden=bool(sem_na)),
             "guard": sem_guard,
             "threshold_density_fallback": {
                 "discourse_instability": sem_disc_density_meta,
@@ -2946,7 +2965,7 @@ def compute_bundle_scores(
         "OUT": "Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 OUT 전용 k_fail 보정, 강한 이탈/상세 패널티를 반영",
         "RID": "diff_residual의 Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 강한 이탈 패널티를 반영",
         "DIAG": "diff_residual·delta_ridge_ens 조합의 q10/q01/q11에서 Rate/Mass를 만들고 강한 이탈 패널티를 반영",
-        "SEM": ("SEM NA-neutral" if sem_na else "discourse_instability·contradiction의 Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 강한 이탈 패널티를 반영"),
+        "SEM": ("SEM score unavailable" if sem_na else "discourse_instability·contradiction의 Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 강한 이탈 패널티를 반영"),
         "CONF": "min(Conf_data,Conf_calc,Conf_th)*Conf_op",
     }
 
@@ -2958,9 +2977,9 @@ def compute_bundle_scores(
         summary_rows.append(
             {
                 "bundle": b,
-                "bundle_score": float(round4(bundle_scores_precise[b])),
-                "bundle_score_bucket": int(bundle_scores_bucket[b]),
-                "New_score": float(round4(bundle_scores_precise[b])),
+                "bundle_score": export_score_or_none(bundle_scores_precise[b], hidden=bool(bundle_hidden.get(b, False))),
+                "bundle_score_bucket": bundle_scores_bucket[b],
+                "New_score": export_score_or_none(bundle_scores_precise[b], hidden=bool(bundle_hidden.get(b, False))),
                 "bundle_band": str(bundle_band.get(b, "")),
                 "bundle_confidence": int(conf),
                 "bundle_conf_warning": int(conf_warn),
@@ -3025,8 +3044,12 @@ def compute_bundle_scores(
                 "bundle": bundle,
                 "submetric": sub_name,
                 "label": f"{bundle}.{sub_name}",
-                "subscore": int(sub.score),
-                "subscore_precise": float(round4(derive_subscore_precise(sub))),
+                "subscore": (None if bool(bundle_hidden.get(bundle, False)) else int(sub.score)),
+                "subscore_precise": (
+                    None
+                    if bool(bundle_hidden.get(bundle, False))
+                    else float(round4(derive_subscore_precise(sub)))
+                ),
                 "raw_value": float(sub.raw_value) if np.isfinite(sub.raw_value) else np.nan,
                 "bucket_value": float(bucket_value) if bucket_value is not None and np.isfinite(float(bucket_value)) else np.nan,
                 "bucket_value_is": str(sub.detail.get("bucket_value_is", "")),
@@ -3065,10 +3088,13 @@ def compute_bundle_scores(
     conf_overall = int(_score_to_int(conf_score))
 
     payload: dict[str, Any] = {
-        "bundle_scores": {b: float(round4(bundle_scores_precise[b])) for b in BUNDLE_ORDER},
-        "bundle_scores_bucket": {b: int(bundle_scores_bucket[b]) for b in BUNDLE_ORDER},
-        "New_score": {b: float(round4(bundle_scores_precise[b])) for b in BUNDLE_ORDER},
-        "new_scores": {b: float(round4(bundle_scores_precise[b])) for b in BUNDLE_ORDER},
+        "bundle_scores": {
+            b: export_score_or_none(bundle_scores_precise[b], hidden=bool(bundle_hidden.get(b, False)))
+            for b in BUNDLE_ORDER
+        },
+        "bundle_scores_bucket": {b: bundle_scores_bucket[b] for b in BUNDLE_ORDER},
+        "New_score": {b: new_scores[b] for b in BUNDLE_ORDER},
+        "new_scores": {b: new_scores[b] for b in BUNDLE_ORDER},
         "bundle_band": {b: str(bundle_band.get(b, "")) for b in BUNDLE_ORDER},
         "bundle_confidence": {b: int(bundle_conf_eval[b]) for b in BUNDLE_ORDER},
         "bundle_conf_warning": {b: int(bundle_conf_warn[b]) for b in BUNDLE_ORDER},
@@ -3121,7 +3147,11 @@ def compute_bundle_scores(
             {
                 "bundle": s.bundle,
                 "submetric": s.name,
-                "subscore_precise": float(round4(derive_subscore_precise(s))),
+                "subscore_precise": (
+                    None
+                    if bool(bundle_hidden.get(s.bundle, False))
+                    else float(round4(derive_subscore_precise(s)))
+                ),
                 "raw_value": float(s.raw_value) if np.isfinite(s.raw_value) else None,
                 "bucket_value": float(s.detail.get("bucket_value")) if s.detail.get("bucket_value") is not None else None,
                 "bucket_value_is": str(s.detail.get("bucket_value_is", "")),
@@ -3140,7 +3170,7 @@ def compute_bundle_scores(
                     if s.detail.get("good_norm_used") is not None and np.isfinite(float(s.detail.get("good_norm_used")))
                     else None
                 ),
-                "score": int(s.score),
+                "score": (None if bool(bundle_hidden.get(s.bundle, False)) else int(s.score)),
                 "bucket_source": s.bucket_source,
                 "bucket_kind": s.kind,
                 "detail": s.detail,

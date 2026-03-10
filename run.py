@@ -2902,7 +2902,16 @@ def build_bundle_ab_interpretation_csv(
 
         bundle_score = float(sum_row.get("bundle_score", np.nan))
         new_score = float(sum_row.get("New_score", bundle_score))
-        bundle_bucket = int(sum_row.get("bundle_score_bucket", 0)) if np.isfinite(float(sum_row.get("bundle_score_bucket", np.nan))) else 0
+        bundle_bucket = (
+            int(sum_row.get("bundle_score_bucket", 0))
+            if np.isfinite(float(sum_row.get("bundle_score_bucket", np.nan)))
+            else np.nan
+        )
+        subscore = (
+            int(r.get("subscore", 0))
+            if np.isfinite(float(r.get("subscore", np.nan)))
+            else np.nan
+        )
         rows.append(
             {
                 "case_id": f"{tag}_{stem}",
@@ -2914,8 +2923,8 @@ def build_bundle_ab_interpretation_csv(
                 "bundle_score_bucket": bundle_bucket,
                 "bundle_confidence": int(sum_row.get("bundle_confidence", 0)) if sum_row else 0,
                 "bundle_conf_warning": int(sum_row.get("bundle_conf_warning", 0)) if sum_row else 0,
-                "bundle_interpretation": _score_band_text(float(bundle_bucket)),
-                "subscore": int(r.get("subscore", 0)),
+                "bundle_interpretation": (_score_band_text(float(bundle_bucket)) if np.isfinite(bundle_bucket) else ""),
+                "subscore": subscore,
                 "subscore_precise": subscore_precise if np.isfinite(subscore_precise) else np.nan,
                 "raw_value": float(r.get("raw_value", np.nan)) if np.isfinite(float(r.get("raw_value", np.nan))) else np.nan,
                 "bucket_value": float(r.get("bucket_value", np.nan)) if np.isfinite(float(r.get("bucket_value", np.nan))) else np.nan,

@@ -2,3 +2,5 @@ report/
 data/
 __pycache__/
 *.py[cod]
+*.npy
+*.json

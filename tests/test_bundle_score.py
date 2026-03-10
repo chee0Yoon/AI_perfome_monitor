@@ -160,6 +160,36 @@ class BundleScoreZeroThresholdFallbackTest(unittest.TestCase):
         rid_score = float(artifacts.summary_df.loc[artifacts.summary_df["bundle"] == "RID", "bundle_score"].iloc[0])
         self.assertAlmostEqual(rid_score, 3.0, places=8)
 
+    def test_sem_not_applicable_exports_null_bundle_score(self) -> None:
+        row_df = self._base_row_df()
+        row_df["discourse_instability_signal_nomask"] = [0.0] * len(row_df)
+        row_df["contradiction_signal_nomask"] = [0.0] * len(row_df)
+        row_df["discourse_instability_state_nomask"] = ["pass"] * len(row_df)
+        row_df["contradiction_state_nomask"] = ["pass"] * len(row_df)
+
+        artifacts = compute_bundle_scores(
+            row_df=row_df,
+            threshold_summary_df=self._threshold_df(),
+            score_runtime=SCORE_RUNTIME,
+            input_norm=None,
+            output_norm=None,
+            embedding_meta={"source": "unit_test_sem_null_when_not_applicable"},
+        )
+
+        sem_row = artifacts.summary_df.loc[artifacts.summary_df["bundle"] == "SEM"].iloc[0]
+        self.assertTrue(pd.isna(sem_row["bundle_score"]))
+        self.assertTrue(pd.isna(sem_row["New_score"]))
+        self.assertTrue(pd.isna(sem_row["bundle_score_bucket"]))
+        self.assertEqual(str(sem_row["key_risk_note"]), "SEM score unavailable")
+
+        sem_detail = artifacts.detail_df.loc[artifacts.detail_df["bundle"] == "SEM"]
+        self.assertTrue(sem_detail["subscore"].isna().all())
+        self.assertTrue(sem_detail["subscore_precise"].isna().all())
+
+        self.assertIsNone(artifacts.payload["bundle_scores"]["SEM"])
+        self.assertIsNone(artifacts.payload["bundle_scores_bucket"]["SEM"])
+        self.assertIsNone(artifacts.payload["new_scores"]["SEM"])
+
 
 if __name__ == "__main__":
     unittest.main()
