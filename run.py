@@ -8,7 +8,7 @@ and produces:
 - run_config.json
 - rule_thresholds.csv (rule-level core/tail_start/exceptional_out + warn/fail/hard aliases)
 - rule_thresholds_compact.csv (compact view)
-- nomask diagnostics HTML (Graph1/2/3)
+- distribution diagnostics HTML (Graph1/2/3)
 - diagnostics summary CSV
 
 Threshold policy is fixed to hybrid derivative:
@@ -67,10 +67,10 @@ from final_metric_refactor.report.plots import (
 from final_metric_refactor.shared.geometry import knn_self  # type: ignore
 from final_metric_refactor.embedding.embedder import build_embedder as _build_embedder_module
 from final_metric_refactor.embedding.cache import (
-    build_nomask_cache_paths,
-    load_nomask_cache,
-    load_or_rebuild_nomask_cache,
-    resolve_nomask_cache_paths,
+    build_embedding_cache_paths,
+    load_embedding_cache,
+    load_or_rebuild_embedding_cache,
+    resolve_embedding_cache_paths,
 )
 from final_metric_refactor.config import (
     DISTRIBUTION_SIGNAL_RUNTIME,
@@ -825,7 +825,7 @@ def _resolve_embedding_cache_meta_path(
                         notes["row_run_config"] = str(peer_cfg)
                         return p, notes
 
-    default_paths = build_nomask_cache_paths(output_dir=out_dir, tag=tag, stem=stem)
+    default_paths = build_embedding_cache_paths(output_dir=out_dir, tag=tag, stem=stem)
     notes["selected_from"] = "default_output_dir"
     return default_paths.meta_json_path.resolve(), notes
 
@@ -836,6 +836,14 @@ def _resolve_dashboard_diagnostics_path(
 ) -> tuple[Path | None, dict[str, Any]]:
     if diagnostics_html_out.exists():
         return diagnostics_html_out.resolve(), {"selected_from": "current_run_or_existing"}
+    legacy = diagnostics_html_out.with_name(
+        diagnostics_html_out.name.replace(
+            "_distribution_diagnostics.html",
+            "_nomask_hist_geometry_hybrid_derivative.html",
+        )
+    )
+    if legacy.exists():
+        return legacy.resolve(), {"selected_from": "legacy_distribution_diagnostics"}
     # run_final_metric always emits diagnostics HTML.
     return diagnostics_html_out.resolve(), {"selected_from": "current_run"}
 
@@ -879,9 +887,13 @@ def _path_to_href(path: Path) -> str:
 def _leaf_label_from_hist_name(path: Path) -> str:
     name = path.name
     marker = "__leaf__"
-    suffix = "_leaf_nomask_signal_hist.html"
-    if marker in name and name.endswith(suffix):
-        return name.split(marker, 1)[1][: -len(suffix)]
+    suffixes = (
+        "_leaf_distribution_signal_hist.html",
+        "_leaf_nomask_signal_hist.html",
+    )
+    for suffix in suffixes:
+        if marker in name and name.endswith(suffix):
+            return name.split(marker, 1)[1][: -len(suffix)]
     return path.stem
 
 
@@ -920,7 +932,11 @@ def _render_leaf_distribution_section_html(
 
     leaf_hist_files: list[Path] = []
     if report_dir is not None and report_dir.exists():
-        leaf_hist_files = sorted(report_dir.glob("*_leaf_nomask_signal_hist.html"))
+        seen: dict[Path, None] = {}
+        for pattern in ("*_leaf_distribution_signal_hist.html", "*_leaf_nomask_signal_hist.html"):
+            for path in sorted(report_dir.glob(pattern)):
+                seen[path] = None
+        leaf_hist_files = list(seen.keys())
 
     parts.append(
         "<div class='meta'>"
@@ -1967,7 +1983,7 @@ def apply_hybrid_thresholds_nomask(
     return out, pd.DataFrame(summary_rows)
 
 
-def render_nomask_plot(
+def render_distribution_diagnostics_plot(
     source_df: pd.DataFrame,
     row_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -1998,7 +2014,7 @@ def render_nomask_plot(
 
     html_parts: list[str] = []
     html_parts.append(
-        "<html><head><meta charset='utf-8'><title>Final Metric Nomask Diagnostics</title>"
+        "<html><head><meta charset='utf-8'><title>Final Metric Distribution Diagnostics</title>"
         "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:24px;}"
         "h1{margin-bottom:8px;}h2{margin-top:34px;margin-bottom:8px;}h3{margin-top:16px;margin-bottom:8px;}"
         ".meta{color:#374151;font-size:13px;margin-bottom:16px;}.chart{margin-bottom:18px;}"
@@ -2011,7 +2027,7 @@ def render_nomask_plot(
         "th:first-child,td:first-child{text-align:left;}th{background:#f8fafc;}"
         "code{background:#f3f4f6;padding:2px 6px;border-radius:6px;}</style></head><body>"
     )
-    html_parts.append("<h1>Final Metric Nomask Diagnostics</h1>")
+    html_parts.append("<h1>Final Metric Distribution Diagnostics</h1>")
     html_parts.append(
         "<div class='meta'>"
         f"row_results=<code>{args.row_results_csv if args.row_results_csv else '(bootstrapped)'}</code><br>"
@@ -2431,7 +2447,7 @@ def render_nomask_plot(
     pd.DataFrame(plot_summary_rows).to_csv(out_summary_csv, index=False)
 
 
-def render_nomask_plot_fallback(
+def render_distribution_diagnostics_plot_fallback(
     source_df: pd.DataFrame,
     row_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -3276,8 +3292,8 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
     score_dashboard_out = report_dir / f"{tag}_{stem}_bundle_scores_dashboard.html"
     warn_inspect_json_out = report_dir / f"{tag}_{stem}_warn_inspect.json"
     warn_inspect_csv_out = report_dir / f"{tag}_{stem}_warn_inspect.csv"
-    diagnostics_html_out = report_dir / f"{tag}_{stem}_nomask_hist_geometry_hybrid_derivative.html"
-    diagnostics_summary_out = report_dir / f"{tag}_{stem}_nomask_hist_geometry_hybrid_derivative_summary.csv"
+    diagnostics_html_out = report_dir / f"{tag}_{stem}_distribution_diagnostics.html"
+    diagnostics_summary_out = report_dir / f"{tag}_{stem}_distribution_diagnostics_summary.csv"
     dashboard_diagnostics_path, dashboard_diagnostics_meta = _resolve_dashboard_diagnostics_path(
         diagnostics_html_out=diagnostics_html_out,
     )
@@ -3321,7 +3337,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
         tag=tag,
         stem=stem,
     )
-    cache_paths = resolve_nomask_cache_paths(
+    cache_paths = resolve_embedding_cache_paths(
         output_dir=out_dir.resolve(),
         tag=tag,
         stem=stem,
@@ -3333,7 +3349,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
     loaded_cache = None
     cache_error = None
     try:
-        loaded_cache = load_nomask_cache(paths=cache_paths)
+        loaded_cache = load_embedding_cache(paths=cache_paths)
         if int(loaded_cache.input_norm.shape[0]) != len(updated_row_df):
             raise ValueError(
                 f"cache row mismatch: cache={loaded_cache.input_norm.shape[0]}, rows={len(updated_row_df)}"
@@ -3348,8 +3364,8 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
                 embedding_model=str(args.embedding_model),
                 hash_dim=768,
             )
-            loaded_cache = load_or_rebuild_nomask_cache(
-                paths=build_nomask_cache_paths(output_dir=out_dir.resolve(), tag=tag, stem=stem),
+            loaded_cache = load_or_rebuild_embedding_cache(
+                paths=build_embedding_cache_paths(output_dir=out_dir.resolve(), tag=tag, stem=stem),
                 expected_rows=len(updated_row_df),
                 input_texts=updated_row_df["source_input"].fillna("").astype(str).tolist(),
                 output_texts=updated_row_df["source_output"].fillna("").astype(str).tolist(),
@@ -3492,7 +3508,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
 
     if go is None or pio is None:
         print("[WARN] plotly is not installed; generating fallback diagnostics HTML.", file=sys.stderr)
-        render_nomask_plot_fallback(
+        render_distribution_diagnostics_plot_fallback(
             source_df=source_df,
             row_df=updated_row_df,
             summary_df=threshold_summary_df,
@@ -3503,7 +3519,7 @@ def _run_with_args(args: argparse.Namespace) -> RunArtifacts:
             detail_paths=plot_detail_paths,
         )
     else:
-        render_nomask_plot(
+        render_distribution_diagnostics_plot(
             source_df=source_df,
             row_df=updated_row_df,
             summary_df=threshold_summary_df,

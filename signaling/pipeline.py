@@ -4,7 +4,7 @@ Distribution-based anomaly pipeline for input->output diffs.
 
 What this script does:
 1) Dynamic data loading and hard gates (IFEval / schema / text-length)
-2) JSON leaf-value extraction for bundle text construction (nomask only)
+2) JSON leaf-value extraction for bundle text construction (distribution runtime only)
 3) Distribution-based anomaly signals (no clustering):
    - output density outlier
    - input-conditioned direction/length/diff residual outlier
@@ -56,7 +56,7 @@ from final_metric_refactor.hard_gate.textlen_gate import TextLengthGate
 from final_metric_refactor.signaling.scorer import DistributionScorer
 from final_metric_refactor.shared.preprocessor import flatten_json_leaves, safe_json_load
 from final_metric_refactor.embedding.embedder import TextEmbedder, build_embedder as _build_embedder_module
-from final_metric_refactor.embedding.cache import NomaskEmbeddingCacheWriter, build_nomask_cache_paths
+from final_metric_refactor.embedding.cache import EmbeddingCacheWriter, build_embedding_cache_paths
 from final_metric_refactor.shared.geometry import (
     ensure_2d_coords,
     knn_self,
@@ -831,7 +831,7 @@ def build_column_bundles(
             }
         )
 
-    # nomask-only runtime: keep return signature for compatibility.
+    # Single distribution runtime: keep return signature for compatibility.
     return raw_bundles, list(raw_bundles), pd.DataFrame(path_stats_rows)
 
 
@@ -1428,7 +1428,7 @@ def assign_subset_columns(dest_df: pd.DataFrame, subset_index: pd.Index, src_df:
 
 
 def parse_apply_modes(raw: str) -> list[str]:
-    # Operational runtime is nomask-only.
+    # Operational runtime is single-pass distribution only.
     modes: list[str] = []
     for tok in parse_csv_tokens(raw):
         key = tok.strip().lower()
@@ -2169,7 +2169,7 @@ def run_distribution_mode(
     group_id: str,
     label_is_correct: np.ndarray | None = None,
     label_raw: np.ndarray | None = None,
-    cache_writer: NomaskEmbeddingCacheWriter | None = None,
+    cache_writer: EmbeddingCacheWriter | None = None,
     cache_row_indices: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     delta_ens_ranks = list(SIGNAL_RUNTIME.delta_ens_ranks)
@@ -2778,7 +2778,7 @@ def run_distribution_mode_job(
     group_id: str,
     label_is_correct: np.ndarray | None = None,
     label_raw: np.ndarray | None = None,
-    cache_writer: NomaskEmbeddingCacheWriter | None = None,
+    cache_writer: EmbeddingCacheWriter | None = None,
     cache_row_indices: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any], np.ndarray]:
     n = len(input_texts)
@@ -3085,7 +3085,7 @@ def build_detail_leaf_distribution_hits_from_gate(
     return hits[["row_index", "row_id", "group_id", "leaf_path", "signal", "threshold", "failed"]].copy()
 
 
-def apply_detail_leaf_gate_nomask_to_row_result(
+def apply_detail_leaf_gate_to_row_result(
     *,
     result_df: pd.DataFrame,
     leaf_gate_row_df: pd.DataFrame,
@@ -3994,7 +3994,7 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
             f"paths={int(detail_leaf_gate_report.get('leaf_paths_evaluated', 0))}, "
             f"row_hits={int(detail_leaf_gate_report.get('leaf_row_hits', 0))}"
         )
-        result_df = apply_detail_leaf_gate_nomask_to_row_result(
+        result_df = apply_detail_leaf_gate_to_row_result(
             result_df=result_df,
             leaf_gate_row_df=detail_leaf_gate_row_df,
             gate_rules=leaf_gate_rules,
@@ -4044,13 +4044,13 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
             f"rows_evaluated={int(np.sum(detail_metrics['detail_evaluated_nomask']))}, "
             f"rows_failed={int(np.sum(detail_metrics['detail_fail_any_leaf_nomask']))}"
         )
-    nomask_cache_paths = build_nomask_cache_paths(output_dir=root_output_dir, tag=tag, stem=stem)
-    nomask_cache_writer = NomaskEmbeddingCacheWriter(
-        paths=nomask_cache_paths,
+    cache_paths = build_embedding_cache_paths(output_dir=root_output_dir, tag=tag, stem=stem)
+    cache_writer = EmbeddingCacheWriter(
+        paths=cache_paths,
         total_rows=len(result_df),
         dtype="float32",
     )
-    nomask_cache_meta: dict[str, Any] = {}
+    cache_meta: dict[str, Any] = {}
 
     in_text_arr = np.asarray(in_raw, dtype=object)
     out_text_arr = np.asarray(out_raw, dtype=object)
@@ -4063,7 +4063,7 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
             out_eval_texts = out_text_arr[hard_idx].astype(str).tolist()
             in_norm = normalize_rows(sanitize_matrix(model.encode(in_eval_texts, batch_size=int(args.embedding_batch_size))))
             out_norm = normalize_rows(sanitize_matrix(model.encode(out_eval_texts, batch_size=int(args.embedding_batch_size))))
-            nomask_cache_writer.write(
+            cache_writer.write(
                 row_indices=hard_idx,
                 input_norm=np.asarray(in_norm, dtype=np.float32),
                 output_norm=np.asarray(out_norm, dtype=np.float32),
@@ -4195,7 +4195,7 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
                 group_id=gid,
                 label_is_correct=group_label_is_correct,
                 label_raw=group_label_raw,
-                cache_writer=nomask_cache_writer,
+                cache_writer=cache_writer,
                 cache_row_indices=idx_eval_arr,
             )
             result_df = assign_subset_columns(result_df, idx_eval, mode_df)
@@ -4220,7 +4220,7 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
         )
         summary_df = pd.DataFrame(summaries)
 
-    nomask_cache_meta = nomask_cache_writer.finalize(
+    cache_meta = cache_writer.finalize(
         extra_meta={
             "source": "distribution_outlier_pipeline",
             "scope": "nomask",
@@ -4832,11 +4832,11 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
                 "schema_source": schema_source,
                 "embedding_cache": {
                     "scope": "nomask",
-                    "meta_json": str(nomask_cache_paths.meta_json_path.resolve()),
-                    "input_norm_path": str(nomask_cache_paths.input_norm_path.resolve()),
-                    "output_norm_path": str(nomask_cache_paths.output_norm_path.resolve()),
-                    "status": "ready" if bool(nomask_cache_meta) else "empty",
-                    "valid_rows": int(nomask_cache_meta.get("valid_rows", 0)),
+                    "meta_json": str(cache_paths.meta_json_path.resolve()),
+                    "input_norm_path": str(cache_paths.input_norm_path.resolve()),
+                    "output_norm_path": str(cache_paths.output_norm_path.resolve()),
+                    "status": "ready" if bool(cache_meta) else "empty",
+                    "valid_rows": int(cache_meta.get("valid_rows", 0)),
                 },
             },
             ensure_ascii=False,
@@ -4860,8 +4860,8 @@ def _run_with_args(args: argparse.Namespace) -> DistributionRunArtifacts:
         print(f"[DONE] Detail leaf gate report: {detail_leaf_gate_report_path}")
     print(f"[DONE] Top anomalies: {top_anom_print_path}")
     print(f"[DONE] Run config: {config_path}")
-    if nomask_cache_meta:
-        print(f"[DONE] Embedding cache meta: {nomask_cache_paths.meta_json_path.resolve()}")
+    if cache_meta:
+        print(f"[DONE] Embedding cache meta: {cache_paths.meta_json_path.resolve()}")
     if schema is not None:
         print(f"[DONE] Schema used: {schema_path}")
 

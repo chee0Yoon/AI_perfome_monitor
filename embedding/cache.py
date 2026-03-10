@@ -1,12 +1,4 @@
-"""Helpers for normalized embedding cache persistence and reuse.
-
-Cache scope is fixed to nomask normalized embeddings:
-- input_norm
-- output_norm
-
-Files are stored under:
-<output-dir>/_temp/embeddings/
-"""
+"""Helpers for normalized embedding cache persistence and reuse."""
 
 from __future__ import annotations
 
@@ -42,10 +34,21 @@ class LoadedEmbeddingCache:
     meta: dict[str, Any]
 
 
-def build_nomask_cache_paths(output_dir: Path | str, tag: str, stem: str) -> EmbeddingCachePaths:
+def _build_legacy_cache_paths(output_dir: Path | str, tag: str, stem: str) -> EmbeddingCachePaths:
     root = Path(output_dir).resolve()
     cache_dir = root / "_temp" / "embeddings"
     prefix = f"{str(tag)}_{str(stem)}_nomask"
+    return EmbeddingCachePaths(
+        input_norm_path=cache_dir / f"{prefix}_input_norm.f32.npy",
+        output_norm_path=cache_dir / f"{prefix}_output_norm.f32.npy",
+        meta_json_path=cache_dir / f"{prefix}_embedding_cache.json",
+    )
+
+
+def build_embedding_cache_paths(output_dir: Path | str, tag: str, stem: str) -> EmbeddingCachePaths:
+    root = Path(output_dir).resolve()
+    cache_dir = root / "_temp" / "embeddings"
+    prefix = f"{str(tag)}_{str(stem)}"
     return EmbeddingCachePaths(
         input_norm_path=cache_dir / f"{prefix}_input_norm.f32.npy",
         output_norm_path=cache_dir / f"{prefix}_output_norm.f32.npy",
@@ -76,8 +79,8 @@ def _to_unique_row_index(row_indices: np.ndarray | list[int], total_rows: int) -
     return np.asarray(out, dtype=int)
 
 
-class NomaskEmbeddingCacheWriter:
-    """Incremental memmap writer for nomask normalized embeddings."""
+class EmbeddingCacheWriter:
+    """Incremental memmap writer for normalized embeddings."""
 
     def __init__(
         self,
@@ -152,7 +155,7 @@ class NomaskEmbeddingCacheWriter:
 
         meta: dict[str, Any] = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "scope": "nomask",
+            "scope": "distribution",
             "dtype": str(self.dtype),
             "shape": [int(self.total_rows), int(self._dim)],
             "row_alignment": "row_results_index",
@@ -191,7 +194,7 @@ def _paths_from_meta_or_default(
     )
 
 
-def load_nomask_cache(paths: EmbeddingCachePaths) -> LoadedEmbeddingCache:
+def load_embedding_cache(paths: EmbeddingCachePaths) -> LoadedEmbeddingCache:
     meta = _read_meta(paths.meta_json_path)
     resolved_paths = _paths_from_meta_or_default(default_paths=paths, meta=meta)
     if not resolved_paths.input_norm_path.exists():
@@ -205,15 +208,20 @@ def load_nomask_cache(paths: EmbeddingCachePaths) -> LoadedEmbeddingCache:
     return LoadedEmbeddingCache(paths=resolved_paths, input_norm=x, output_norm=y, meta=meta)
 
 
-def resolve_nomask_cache_paths(
+def resolve_embedding_cache_paths(
     *,
     output_dir: Path | str,
     tag: str,
     stem: str,
     meta_json_path: Path | str | None = None,
 ) -> EmbeddingCachePaths:
-    default_paths = build_nomask_cache_paths(output_dir=output_dir, tag=tag, stem=stem)
+    default_paths = build_embedding_cache_paths(output_dir=output_dir, tag=tag, stem=stem)
+    legacy_paths = _build_legacy_cache_paths(output_dir=output_dir, tag=tag, stem=stem)
     if not meta_json_path:
+        if cache_exists(default_paths):
+            return default_paths
+        if cache_exists(legacy_paths):
+            return legacy_paths
         return default_paths
     meta_path = Path(meta_json_path).resolve()
     return EmbeddingCachePaths(
@@ -223,7 +231,7 @@ def resolve_nomask_cache_paths(
     )
 
 
-def rebuild_nomask_cache(
+def rebuild_embedding_cache(
     *,
     paths: EmbeddingCachePaths,
     input_texts: list[str],
@@ -240,7 +248,7 @@ def rebuild_nomask_cache(
     x_norm = normalize_rows(x).astype(np.float32, copy=False)
     y_norm = normalize_rows(y).astype(np.float32, copy=False)
 
-    writer = NomaskEmbeddingCacheWriter(paths=paths, total_rows=n_rows, dtype="float32")
+    writer = EmbeddingCacheWriter(paths=paths, total_rows=n_rows, dtype="float32")
     writer.write(np.arange(n_rows, dtype=int), x_norm, y_norm)
     return writer.finalize(
         {
@@ -251,7 +259,7 @@ def rebuild_nomask_cache(
     )
 
 
-def load_or_rebuild_nomask_cache(
+def load_or_rebuild_embedding_cache(
     *,
     paths: EmbeddingCachePaths,
     expected_rows: int,
@@ -268,13 +276,13 @@ def load_or_rebuild_nomask_cache(
             )
 
     try:
-        loaded = load_nomask_cache(paths=paths)
+        loaded = load_embedding_cache(paths=paths)
         _validate_rows(loaded)
         return loaded
     except Exception:
         if not allow_rebuild:
             raise
-        rebuild_nomask_cache(
+        rebuild_embedding_cache(
             paths=paths,
             input_texts=input_texts,
             output_texts=output_texts,
@@ -282,6 +290,6 @@ def load_or_rebuild_nomask_cache(
             batch_size=batch_size,
             source="auto_rebuild",
         )
-        loaded = load_nomask_cache(paths=paths)
+        loaded = load_embedding_cache(paths=paths)
         _validate_rows(loaded)
         return loaded

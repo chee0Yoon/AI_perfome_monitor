@@ -25,10 +25,10 @@ BUNDLE_LABEL_KO = {
 }
 BUNDLE_DESC_KO = {
     "COV": "HG/finite/available 기반 측정 가능성(coverage)을 나타냅니다.",
-    "OUT": "출력 분포 이탈 위험을 Core/Rate/Mass 축으로 평가합니다.",
-    "RID": "분포 형태 기준 잔차(diff_residual) 이탈 위험을 평가합니다.",
-    "DIAG": "Residual vs Ridge 동시 관찰로 이탈 원인을 q10/q01/q11로 분해합니다.",
-    "SEM": "discourse_instability + contradiction 기반 의미 안정성을 평가합니다.",
+    "OUT": "출력 분포를 Core/Rate/Mass로 집계합니다. 임계값이 0에 몰리면 0 밀집 보정을 적용하고, OUT은 k_fail 기반 보정이 추가됩니다.",
+    "RID": "diff_residual 분포 이탈을 Core/Rate/Mass로 평가합니다. 임계값이 0에 몰린 분포는 공통 0 밀집 보정으로 다룹니다.",
+    "DIAG": "diff_residual과 delta_ridge_ens의 soft-fail 조합(q10/q01/q11)으로 원인을 분해합니다. 입력 분포의 0 밀집 보정 결과를 반영합니다.",
+    "SEM": "discourse_instability와 contradiction을 Core/Rate/Mass로 집계합니다. 임계값이 0에 몰리면 공통 0 밀집 보정을 적용합니다.",
     "CONF": "품질 점수와 분리된 신뢰도(Conf_data/calc/th/op)를 나타냅니다.",
 }
 SUBMETRIC_LABEL_KO = {
@@ -61,21 +61,21 @@ SUBMETRIC_DESC_KO = {
     "Finite_score": "NaN/Inf 없이 계산 가능한 비율",
     "Available_score": "필수 룰의 계산 가능 비율",
     "OUT_core": "정상 코어 구간의 조밀함",
-    "OUT_rate": "fail/hard 기반 경계 이탈 비율 위험",
-    "OUT_mass": "경계 이탈 이후 붕괴 깊이 위험",
+    "OUT_rate": "출력 이탈 비율 위험. hard_fail=0이면 5점, fail=0이면 hard_fail-gap으로 4~5점 0 밀집 보정을 적용합니다.",
+    "OUT_mass": "출력 이탈 심각도 위험. 0 밀집 보정이 발동하면 Rate와 같은 위험도로 함께 보정합니다.",
     "RID_core": "설명가능한 이동의 코어 안정성",
-    "RID_rate": "설명불가 이동의 발생 비율 위험",
-    "RID_mass": "설명되지 않는 이동 강도 위험",
+    "RID_rate": "설명불가 이동의 발생 비율 위험. fail/hard 임계값이 0에 몰리면 공통 0 밀집 보정으로 다룹니다.",
+    "RID_mass": "설명되지 않는 이동 강도 위험. 0 밀집 보정이 발동하면 Rate와 같은 위험도로 함께 보정합니다.",
     "DIAG_core": "DIAG 집계에서 제외되는 참고 코어축(RID_core)",
-    "DIAG_rate": "불안정 상태(Q10+Q01+Q11) 비율",
-    "DIAG_mass": "q11 + 0.5*min(q10,q01) 기반 심각도",
+    "DIAG_rate": "불안정 상태(Q10+Q01+Q11) 비율입니다. diff_residual과 delta_ridge_ens의 0 밀집 보정 이후 집계합니다.",
+    "DIAG_mass": "q11 + 0.5*min(q10,q01) 기반 심각도입니다. diff_residual과 delta_ridge_ens의 0 밀집 보정 이후 집계합니다.",
     "DIAG_stable": "q00: Residual/Ridge 모두 안정인 비율(높을수록 좋음)",
     "DIAG_local": "q10: Residual 중심 분포형 이탈 비율",
     "DIAG_unexplainable": "q01: Ridge 중심 입력조건 예측 이탈 비율",
     "DIAG_systemic": "q11: 형태+예측 동시 붕괴 비율",
-    "SEM_core": "의미/근거 구조의 코어 안정성",
-    "SEM_rate": "의미 구조 이탈 비율 위험",
-    "SEM_mass": "의미 구조 붕괴 심각도",
+    "SEM_core": "discourse_instability와 contradiction 기준 의미/근거 구조의 코어 안정성",
+    "SEM_rate": "의미/근거 충돌 비율 위험입니다. discourse_instability와 contradiction을 합쳐 계산하며 0 밀집 보정을 적용할 수 있습니다.",
+    "SEM_mass": "의미 구조 붕괴 심각도입니다. 0 밀집 보정이 발동하면 Rate와 같은 위험도로 함께 보정합니다.",
     "CONF_data": "샘플 지원도 기반 신뢰도",
     "CONF_calc": "available/finite/NA 상태 기반 신뢰도",
     "CONF_th": "threshold 안정성 기반 신뢰도",
@@ -1466,29 +1466,116 @@ def _state_band_label(
     return "core"
 
 
-def _apply_out_kfail_fallback(
+def _apply_zero_threshold_density_fallback(
     *,
-    out_axes_soft: dict[str, Any],
-    explain_output: dict[str, float | None],
-    output_rule: RuleStat,
-    rate_lambda_output: float,
+    axes_soft: dict[str, Any],
+    stat: RuleStat,
+    gamma: float,
+    zero_threshold_eps: float,
+    zero_fail_floor_score: float,
+    zero_fail_gap_softness: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    used = dict(axes_soft)
+    fail_threshold_raw = float(stat.fail_threshold_raw) if np.isfinite(stat.fail_threshold_raw) else float("nan")
+    hard_threshold_raw = float(stat.hard_threshold_raw) if np.isfinite(stat.hard_threshold_raw) else float("nan")
+    eps = float(max(0.0, zero_threshold_eps))
+
+    soft_r_rate = float(axes_soft.get("r_rate", np.nan))
+    soft_r_mass = float(axes_soft.get("r_mass", np.nan))
+    soft_p_fail = float(axes_soft.get("p_fail", np.nan))
+    soft_p_hard = float(axes_soft.get("p_hard", np.nan))
+
+    applied = False
+    reason = "not_applicable"
+    gap = float("nan")
+    density_score = float("nan")
+    density_risk = float("nan")
+
+    if np.isfinite(hard_threshold_raw) and abs(hard_threshold_raw) <= eps:
+        applied = True
+        reason = "hard_fail_threshold_zero_dense"
+        gap = 0.0
+        density_score = 5.0
+        density_risk = 0.0
+    elif np.isfinite(fail_threshold_raw) and abs(fail_threshold_raw) <= eps and np.isfinite(hard_threshold_raw):
+        applied = True
+        reason = "fail_threshold_zero_dense"
+        gap = float(max(0.0, abs(hard_threshold_raw - fail_threshold_raw)))
+        floor_score = float(np.clip(zero_fail_floor_score, 0.0, 5.0))
+        softness = float(max(EPS, zero_fail_gap_softness))
+        decay = float(1.0 + np.log1p(gap / softness))
+        density_score = float(floor_score + ((5.0 - floor_score) / decay))
+        density_risk = float(np.clip(1.0 - (density_score / 5.0), 0.0, 1.0))
+
+    if applied:
+        used.update(
+            {
+                "r_rate": float(density_risk),
+                "r_mass": float(density_risk),
+                "q_rate": float(_quality_from_risk(density_risk, gamma=gamma)),
+                "q_mass": float(_quality_from_risk(density_risk, gamma=gamma)),
+                "p_fail": float(density_risk),
+                "p_hard": 0.0,
+            }
+        )
+
+        valid = np.asarray(stat.valid_mask, dtype=bool)
+        pf_soft = np.asarray(axes_soft.get("p_fail_soft", np.full(len(valid), np.nan)), dtype=float).copy()
+        ph_soft = np.asarray(axes_soft.get("p_hard_soft", np.full(len(valid), np.nan)), dtype=float).copy()
+        if pf_soft.shape == valid.shape:
+            pf_soft[valid] = float(density_risk)
+            used["p_fail_soft"] = pf_soft
+        if ph_soft.shape == valid.shape:
+            ph_soft[valid] = 0.0
+            used["p_hard_soft"] = ph_soft
+
+    meta: dict[str, Any] = {
+        "rule": str(stat.rule),
+        "applied": bool(applied),
+        "reason": str(reason),
+        "fail_threshold_raw": (float(fail_threshold_raw) if np.isfinite(fail_threshold_raw) else None),
+        "hard_threshold_raw": (float(hard_threshold_raw) if np.isfinite(hard_threshold_raw) else None),
+        "gap": (float(gap) if np.isfinite(gap) else None),
+        "density_score": (float(density_score) if np.isfinite(density_score) else None),
+        "density_risk": (float(density_risk) if np.isfinite(density_risk) else None),
+        "zero_threshold_eps": float(eps),
+        "zero_fail_floor_score": float(np.clip(zero_fail_floor_score, 0.0, 5.0)),
+        "zero_fail_gap_softness": float(max(EPS, zero_fail_gap_softness)),
+        "r_rate_soft_raw": (float(soft_r_rate) if np.isfinite(soft_r_rate) else None),
+        "r_mass_soft_raw": (float(soft_r_mass) if np.isfinite(soft_r_mass) else None),
+        "p_fail_soft_raw": (float(soft_p_fail) if np.isfinite(soft_p_fail) else None),
+        "p_hard_soft_raw": (float(soft_p_hard) if np.isfinite(soft_p_hard) else None),
+        "r_rate_used": (float(used.get("r_rate")) if np.isfinite(float(used.get("r_rate", np.nan))) else None),
+        "r_mass_used": (float(used.get("r_mass")) if np.isfinite(float(used.get("r_mass", np.nan))) else None),
+        "p_fail_used": (float(used.get("p_fail")) if np.isfinite(float(used.get("p_fail", np.nan))) else None),
+        "p_hard_used": (float(used.get("p_hard")) if np.isfinite(float(used.get("p_hard", np.nan))) else None),
+    }
+    return used, meta
+
+
+def _apply_rule_state_rate_kfail_fallback(
+    *,
+    axes_soft: dict[str, Any],
+    explain: dict[str, float | None],
+    stat: RuleStat,
+    rate_lambda: float,
     eta_hard: float,
     gamma: float,
     kfail_fallback_cutoff: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    used = dict(out_axes_soft)
+    used = dict(axes_soft)
 
-    k_fail = float(output_rule.k_fail) if np.isfinite(output_rule.k_fail) else float("nan")
+    k_fail = float(stat.k_fail) if np.isfinite(stat.k_fail) else float("nan")
     cutoff = float(max(0.0, kfail_fallback_cutoff))
-    state_fail = explain_output.get("state_fail_rate")
-    state_hard = explain_output.get("state_hard_rate")
+    state_fail = explain.get("state_fail_rate")
+    state_hard = explain.get("state_hard_rate")
     state_fail_f = float(state_fail) if state_fail is not None and np.isfinite(float(state_fail)) else float("nan")
     state_hard_f = float(state_hard) if state_hard is not None and np.isfinite(float(state_hard)) else float("nan")
 
-    soft_r_rate = float(out_axes_soft.get("r_rate", np.nan))
-    soft_r_mass = float(out_axes_soft.get("r_mass", np.nan))
-    soft_p_fail = float(out_axes_soft.get("p_fail", np.nan))
-    soft_p_hard = float(out_axes_soft.get("p_hard", np.nan))
+    soft_r_rate = float(axes_soft.get("r_rate", np.nan))
+    soft_r_mass = float(axes_soft.get("r_mass", np.nan))
+    soft_p_fail = float(axes_soft.get("p_fail", np.nan))
+    soft_p_hard = float(axes_soft.get("p_hard", np.nan))
 
     applied = False
     reason = "below_cutoff"
@@ -1496,7 +1583,7 @@ def _apply_out_kfail_fallback(
         if np.isfinite(state_fail_f) or np.isfinite(state_hard_f):
             sf = float(np.clip(state_fail_f, 0.0, 1.0)) if np.isfinite(state_fail_f) else 0.0
             sh = float(np.clip(state_hard_f, 0.0, 1.0)) if np.isfinite(state_hard_f) else 0.0
-            used_r_rate = _clip01(sf + float(rate_lambda_output) * sh)
+            used_r_rate = _clip01(sf + float(rate_lambda) * sh)
             used_r_mass = _clip01(sf + float(max(0.0, eta_hard)) * sh)
             used.update(
                 {
@@ -1530,6 +1617,85 @@ def _apply_out_kfail_fallback(
         "p_fail_used": (float(used.get("p_fail")) if np.isfinite(float(used.get("p_fail", np.nan))) else None),
         "p_hard_used": (float(used.get("p_hard")) if np.isfinite(float(used.get("p_hard", np.nan))) else None),
     }
+    return used, meta
+
+
+def _apply_rule_score_fallbacks(
+    *,
+    axes_soft: dict[str, Any],
+    stat: RuleStat,
+    gamma: float,
+    zero_threshold_eps: float,
+    zero_fail_floor_score: float,
+    zero_fail_gap_softness: float,
+    explain: dict[str, float | None] | None = None,
+    rate_lambda: float | None = None,
+    eta_hard: float | None = None,
+    kfail_fallback_cutoff: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    used, zero_threshold_meta = _apply_zero_threshold_density_fallback(
+        axes_soft=axes_soft,
+        stat=stat,
+        gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
+    )
+
+    state_rate_kfail_meta: dict[str, Any] = {
+        "applied": False,
+        "reason": "disabled",
+        "k_fail": None,
+        "k_fail_abs": None,
+        "k_fail_cutoff": (float(max(0.0, kfail_fallback_cutoff)) if kfail_fallback_cutoff is not None else None),
+        "state_fail_rate": None,
+        "state_hard_rate": None,
+        "r_rate_soft_raw": (float(axes_soft.get("r_rate")) if np.isfinite(float(axes_soft.get("r_rate", np.nan))) else None),
+        "r_mass_soft_raw": (float(axes_soft.get("r_mass")) if np.isfinite(float(axes_soft.get("r_mass", np.nan))) else None),
+        "p_fail_soft_raw": (float(axes_soft.get("p_fail")) if np.isfinite(float(axes_soft.get("p_fail", np.nan))) else None),
+        "p_hard_soft_raw": (float(axes_soft.get("p_hard")) if np.isfinite(float(axes_soft.get("p_hard", np.nan))) else None),
+        "r_rate_used": (float(used.get("r_rate")) if np.isfinite(float(used.get("r_rate", np.nan))) else None),
+        "r_mass_used": (float(used.get("r_mass")) if np.isfinite(float(used.get("r_mass", np.nan))) else None),
+        "p_fail_used": (float(used.get("p_fail")) if np.isfinite(float(used.get("p_fail", np.nan))) else None),
+        "p_hard_used": (float(used.get("p_hard")) if np.isfinite(float(used.get("p_hard", np.nan))) else None),
+    }
+
+    if (
+        not bool(zero_threshold_meta.get("applied", False))
+        and explain is not None
+        and rate_lambda is not None
+        and eta_hard is not None
+        and kfail_fallback_cutoff is not None
+    ):
+        used, state_rate_kfail_meta = _apply_rule_state_rate_kfail_fallback(
+            axes_soft=used,
+            explain=explain,
+            stat=stat,
+            rate_lambda=float(rate_lambda),
+            eta_hard=float(eta_hard),
+            gamma=gamma,
+            kfail_fallback_cutoff=float(kfail_fallback_cutoff),
+        )
+
+    applied = bool(zero_threshold_meta.get("applied", False)) or bool(state_rate_kfail_meta.get("applied", False))
+    if bool(zero_threshold_meta.get("applied", False)):
+        reason = str(zero_threshold_meta.get("reason", ""))
+    elif bool(state_rate_kfail_meta.get("applied", False)):
+        reason = str(state_rate_kfail_meta.get("reason", "disabled"))
+    elif explain is not None and kfail_fallback_cutoff is not None:
+        reason = str(state_rate_kfail_meta.get("reason", "disabled"))
+    else:
+        reason = str(zero_threshold_meta.get("reason", "not_applicable"))
+    meta = dict(state_rate_kfail_meta)
+    meta.update(
+        {
+            "rule": str(stat.rule),
+            "applied": bool(applied),
+            "reason": str(reason),
+            "zero_threshold_density": zero_threshold_meta,
+            "state_rate_kfail": state_rate_kfail_meta,
+        }
+    )
     return used, meta
 
 
@@ -1733,6 +1899,9 @@ def compute_bundle_scores(
     hard_tail_penalty_alpha = float(getattr(score_runtime, "new_score_hard_tail_penalty_alpha", 0.25))
     detail_penalty_alpha = float(getattr(score_runtime, "new_score_detail_penalty_alpha", 0.35))
     out_kfail_fallback_cutoff = float(getattr(score_runtime, "new_score_out_kfail_fallback_cutoff", 20.0))
+    zero_threshold_eps = float(getattr(score_runtime, "new_score_zero_threshold_eps", 1e-12))
+    zero_fail_floor_score = float(getattr(score_runtime, "new_score_zero_fail_floor_score", 4.0))
+    zero_fail_gap_softness = float(getattr(score_runtime, "new_score_zero_fail_gap_softness", 1.0))
 
     s_core_output = float(getattr(score_runtime, "new_score_s_core_output", 0.50))
     s_core_diff = float(getattr(score_runtime, "new_score_s_core_diff_residual", 0.50))
@@ -1812,6 +1981,14 @@ def compute_bundle_scores(
         core_quantile=core_quantile,
         eta_hard=eta,
     )
+    rid_axes, rid_density_meta = _apply_rule_score_fallbacks(
+        axes_soft=rid_axes,
+        stat=rules["diff_residual"],
+        gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
+    )
     sem_disc_axes = _continuous_rule_axis_profile(
         stat=rules["discourse_instability"],
         rate_lambda=rate_lambda_semantic,
@@ -1824,6 +2001,14 @@ def compute_bundle_scores(
         tau_mass=tau_mass,
         core_quantile=core_quantile,
         eta_hard=eta,
+    )
+    sem_disc_axes, sem_disc_density_meta = _apply_rule_score_fallbacks(
+        axes_soft=sem_disc_axes,
+        stat=rules["discourse_instability"],
+        gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
     )
     sem_contr_axes = _continuous_rule_axis_profile(
         stat=rules["contradiction"],
@@ -1838,6 +2023,14 @@ def compute_bundle_scores(
         core_quantile=core_quantile,
         eta_hard=eta,
     )
+    sem_contr_axes, sem_contr_density_meta = _apply_rule_score_fallbacks(
+        axes_soft=sem_contr_axes,
+        stat=rules["contradiction"],
+        gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
+    )
     ridge_axes = _continuous_rule_axis_profile(
         stat=rules["delta_ridge_ens"],
         rate_lambda=rate_lambda_residual,
@@ -1851,6 +2044,14 @@ def compute_bundle_scores(
         core_quantile=core_quantile,
         eta_hard=eta,
     )
+    ridge_axes, ridge_density_meta = _apply_rule_score_fallbacks(
+        axes_soft=ridge_axes,
+        stat=rules["delta_ridge_ens"],
+        gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
+    )
 
     # Thresholds are downgraded to state/why explainer only.
     explain_output = _threshold_explain_profile(row_df=row_df, rule="output", stat=rules["output"])
@@ -1858,13 +2059,16 @@ def compute_bundle_scores(
     explain_ridge = _threshold_explain_profile(row_df=row_df, rule="delta_ridge_ens", stat=rules["delta_ridge_ens"])
     explain_disc = _threshold_explain_profile(row_df=row_df, rule="discourse_instability", stat=rules["discourse_instability"])
     explain_contr = _threshold_explain_profile(row_df=row_df, rule="contradiction", stat=rules["contradiction"])
-    out_axes, out_fallback_meta = _apply_out_kfail_fallback(
-        out_axes_soft=out_axes,
-        explain_output=explain_output,
-        output_rule=rules["output"],
-        rate_lambda_output=rate_lambda_output,
-        eta_hard=eta,
+    out_axes, out_fallback_meta = _apply_rule_score_fallbacks(
+        axes_soft=out_axes,
+        stat=rules["output"],
         gamma=gamma,
+        zero_threshold_eps=zero_threshold_eps,
+        zero_fail_floor_score=zero_fail_floor_score,
+        zero_fail_gap_softness=zero_fail_gap_softness,
+        explain=explain_output,
+        rate_lambda=rate_lambda_output,
+        eta_hard=eta,
         kfail_fallback_cutoff=out_kfail_fallback_cutoff,
     )
 
@@ -2308,6 +2512,7 @@ def compute_bundle_scores(
                 "excess_hard": explain_diff.get("excess_hard"),
                 "state_fail_rate": explain_diff.get("state_fail_rate"),
                 "state_hard_rate": explain_diff.get("state_hard_rate"),
+                "threshold_density_adjustment": rid_density_meta,
                 "band": str(bundle_band.get("RID", "")),
             },
         ),
@@ -2325,6 +2530,7 @@ def compute_bundle_scores(
                 "excess_hard": explain_diff.get("excess_hard"),
                 "state_fail_rate": explain_diff.get("state_fail_rate"),
                 "state_hard_rate": explain_diff.get("state_hard_rate"),
+                "threshold_density_adjustment": rid_density_meta,
                 "band": str(bundle_band.get("RID", "")),
             },
         ),
@@ -2355,6 +2561,10 @@ def compute_bundle_scores(
                 "q11_state": float(q11) if np.isfinite(q11) else None,
                 "diag_cause": str(diag_cause),
                 "diag_cause_state": str(diag_cause_state),
+                "threshold_density_adjustments": {
+                    "diff_residual": rid_density_meta,
+                    "delta_ridge_ens": ridge_density_meta,
+                },
             },
         ),
         _submetric_from_risk(
@@ -2372,6 +2582,10 @@ def compute_bundle_scores(
                 "q11_state": float(q11) if np.isfinite(q11) else None,
                 "diag_cause": str(diag_cause),
                 "diag_cause_state": str(diag_cause_state),
+                "threshold_density_adjustments": {
+                    "diff_residual": rid_density_meta,
+                    "delta_ridge_ens": ridge_density_meta,
+                },
             },
         ),
         _submetric_from_good(
@@ -2498,6 +2712,10 @@ def compute_bundle_scores(
                         "state_fail_contr": explain_contr.get("state_fail_rate"),
                         "state_hard_disc": explain_disc.get("state_hard_rate"),
                         "state_hard_contr": explain_contr.get("state_hard_rate"),
+                        "threshold_density_adjustments": {
+                            "discourse_instability": sem_disc_density_meta,
+                            "contradiction": sem_contr_density_meta,
+                        },
                         "band": sem_band,
                     },
                 ),
@@ -2507,7 +2725,13 @@ def compute_bundle_scores(
                     raw_value=float(_nanmean_or_nan([float(sem_disc_axes["tail_mass"]), float(sem_contr_axes["tail_mass"])])),
                     risk=float(sem_r_mass),
                     neutral_score=na_neutral_score,
-                    detail={"band": sem_band},
+                    detail={
+                        "threshold_density_adjustments": {
+                            "discourse_instability": sem_disc_density_meta,
+                            "contradiction": sem_contr_density_meta,
+                        },
+                        "band": sem_band,
+                    },
                 ),
             ]
         )
@@ -2601,6 +2825,7 @@ def compute_bundle_scores(
             "score_precise": float(round4(rid_score)),
             "score_bucket": int(bundle_scores_bucket["RID"]),
             "guard": rid_guard,
+            "threshold_density_fallback": rid_density_meta,
         },
         "DIAG": {
             "mode": "threshold_free_noisy_or_diag",
@@ -2616,6 +2841,10 @@ def compute_bundle_scores(
             "score_precise": float(round4(diag_score)),
             "score_bucket": int(bundle_scores_bucket["DIAG"]),
             "guard": diag_guard,
+            "threshold_density_fallback": {
+                "diff_residual": rid_density_meta,
+                "delta_ridge_ens": ridge_density_meta,
+            },
         },
         "SEM": {
             "mode": ("sem_na" if sem_na else "threshold_free_noisy_or"),
@@ -2631,6 +2860,10 @@ def compute_bundle_scores(
             "score_precise": float(round4(sem_score)),
             "score_bucket": int(bundle_scores_bucket["SEM"]),
             "guard": sem_guard,
+            "threshold_density_fallback": {
+                "discourse_instability": sem_disc_density_meta,
+                "contradiction": sem_contr_density_meta,
+            },
         },
     }
 
@@ -2660,6 +2893,7 @@ def compute_bundle_scores(
             "bundle_or_risk_base": float(rid_risk_base) if np.isfinite(rid_risk_base) else None,
             "hard_tail_penalty": float(rid_hard_tail_penalty) if np.isfinite(rid_hard_tail_penalty) else None,
             "bundle_or_risk": float(rid_risk) if np.isfinite(rid_risk) else None,
+            "threshold_density_fallback": rid_density_meta,
         },
         "DIAG": {
             "core": float(diag_core_risk_ref) if np.isfinite(diag_core_risk_ref) else None,
@@ -2668,6 +2902,10 @@ def compute_bundle_scores(
             "bundle_or_risk_base": float(diag_risk_base) if np.isfinite(diag_risk_base) else None,
             "hard_tail_penalty": float(diag_hard_tail_penalty) if np.isfinite(diag_hard_tail_penalty) else None,
             "bundle_or_risk": float(diag_risk) if np.isfinite(diag_risk) else None,
+            "threshold_density_fallback": {
+                "diff_residual": rid_density_meta,
+                "delta_ridge_ens": ridge_density_meta,
+            },
         },
         "SEM": {
             "core": float(sem_r_core) if np.isfinite(sem_r_core) else None,
@@ -2676,6 +2914,10 @@ def compute_bundle_scores(
             "bundle_or_risk_base": float(sem_risk_base) if np.isfinite(sem_risk_base) else None,
             "hard_tail_penalty": float(sem_hard_tail_penalty) if np.isfinite(sem_hard_tail_penalty) else None,
             "bundle_or_risk": float(sem_risk) if np.isfinite(sem_risk) else None,
+            "threshold_density_fallback": {
+                "discourse_instability": sem_disc_density_meta,
+                "contradiction": sem_contr_density_meta,
+            },
         },
     }
 
@@ -2701,10 +2943,10 @@ def compute_bundle_scores(
     key_risk_raw_map = dict(key_risk_map)
     key_risk_note = {
         "COV": "coverage=HG∧finite∧available",
-            "OUT": "threshold_free noisyOR(core,rate,mass)+soft_hard_tail+detail_penalty",
-        "RID": "threshold_free noisyOR(core,rate,mass)+soft_hard_tail",
-        "DIAG": "threshold_free noisyOR(rate,mass)+soft_hard_tail, core is reference",
-        "SEM": ("SEM NA-neutral" if sem_na else "threshold_free noisyOR(core,rate,mass)+soft_hard_tail"),
+        "OUT": "Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 OUT 전용 k_fail 보정, 강한 이탈/상세 패널티를 반영",
+        "RID": "diff_residual의 Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 강한 이탈 패널티를 반영",
+        "DIAG": "diff_residual·delta_ridge_ens 조합의 q10/q01/q11에서 Rate/Mass를 만들고 강한 이탈 패널티를 반영",
+        "SEM": ("SEM NA-neutral" if sem_na else "discourse_instability·contradiction의 Core/Rate/Mass를 noisy-OR로 합치고, 0 밀집 보정과 강한 이탈 패널티를 반영"),
         "CONF": "min(Conf_data,Conf_calc,Conf_th)*Conf_op",
     }
 
@@ -2853,6 +3095,9 @@ def compute_bundle_scores(
             "new_score_hard_tail_penalty_alpha": float(hard_tail_penalty_alpha),
             "new_score_detail_penalty_alpha": float(detail_penalty_alpha),
             "new_score_out_kfail_fallback_cutoff": float(out_kfail_fallback_cutoff),
+            "new_score_zero_threshold_eps": float(zero_threshold_eps),
+            "new_score_zero_fail_floor_score": float(zero_fail_floor_score),
+            "new_score_zero_fail_gap_softness": float(zero_fail_gap_softness),
             "new_score_na_neutral_score": float(na_neutral_score),
             "new_score_sem_na_neutral_score": float(sem_na_neutral_score),
             "new_score_scales": {
@@ -2934,6 +3179,13 @@ def compute_bundle_scores(
                 "discourse_instability": explain_disc,
                 "contradiction": explain_contr,
                 "output_out_kfail_fallback": out_fallback_meta,
+                "zero_threshold_density_adjustments": {
+                    "output": out_fallback_meta.get("zero_threshold_density", {}),
+                    "diff_residual": rid_density_meta,
+                    "delta_ridge_ens": ridge_density_meta,
+                    "discourse_instability": sem_disc_density_meta,
+                    "contradiction": sem_contr_density_meta,
+                },
             },
             "semantic": {
                 "sem_uninformative": bool(sem_uninformative),

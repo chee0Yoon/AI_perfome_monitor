@@ -122,6 +122,11 @@ class ScoreRuntimeConfig:
     new_score_s_mass_delta_ridge_ens: float = 0.50
     new_score_s_mass_discourse_instability: float = 0.50
     new_score_s_mass_contradiction: float = 0.50
+    # Zero-threshold dense fallback: if hard_fail == 0 -> 5.0,
+    # if fail == 0 -> interpolate within [floor, 5.0] by fail-hard gap.
+    new_score_zero_threshold_eps: float = 1e-12
+    new_score_zero_fail_floor_score: float = 4.0
+    new_score_zero_fail_gap_softness: float = 1.0
     # OUT axis fallback: when threshold-derived k_fail is abnormally large,
     # use threshold-state rates to stabilize OUT_rate/OUT_mass.
     new_score_out_kfail_fallback_cutoff: float = 20.0
